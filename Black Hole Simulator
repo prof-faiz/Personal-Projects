@@ -1,0 +1,77 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Aug 30 21:50:22 2025
+
+@author: khanf
+"""
+
+"""
+Simplest fake black hole visualizer using pygame.
+No heavy ray tracing, just circles, stars, and a warped disk.
+Runs smoothly on any laptop.
+
+Controls:
+  Left/Right = rotate camera around
+"""
+
+import pygame, random, math
+
+# --- Settings ---
+WIDTH, HEIGHT = 600, 600
+BLACKHOLE_RADIUS = 80
+DISK_RADIUS = 200
+NUM_STARS = 300
+
+# --- Init ---
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+clock = pygame.time.Clock()
+
+# Starfield
+stars = [(random.randint(0, WIDTH), random.randint(0, HEIGHT)) for _ in range(NUM_STARS)]
+
+angle = 0  # camera rotation
+
+running = True
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+    keys = pygame.key.get_pressed()
+    if keys[pygame.K_LEFT]:
+        angle -= 0.02
+    if keys[pygame.K_RIGHT]:
+        angle += 0.02
+
+    # --- Draw background (stars) ---
+    screen.fill((0, 0, 20))
+    for sx, sy in stars:
+        pygame.draw.circle(screen, (255, 255, 255), (sx, sy), 1)
+
+    # --- Draw warped accretion disk ---
+    for r in range(BLACKHOLE_RADIUS + 10, DISK_RADIUS, 2):
+        brightness = int(200 - (r - BLACKHOLE_RADIUS) * 0.5)
+        color = (brightness, int(brightness * 0.5), 0)
+        # simulate lensing: draw both top and mirrored bottom
+        offset = int(30 * (BLACKHOLE_RADIUS / r))  # fake warp
+        pygame.draw.ellipse(
+            screen,
+            color,
+            (WIDTH//2 - r, HEIGHT//2 - offset//2, 2*r, offset),
+            1
+        )
+        pygame.draw.ellipse(
+            screen,
+            color,
+            (WIDTH//2 - r, HEIGHT//2 + offset//2, 2*r, offset),
+            1
+        )
+
+    # --- Draw black hole ---
+    pygame.draw.circle(screen, (0, 0, 0), (WIDTH//2, HEIGHT//2), BLACKHOLE_RADIUS)
+
+    pygame.display.flip()
+    clock.tick(30)
+
+pygame.quit()
