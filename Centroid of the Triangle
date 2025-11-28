@@ -1,0 +1,118 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov  5 17:25:50 2025
+
+@author: khanf
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import random
+
+def distance(p1, p2):
+    """Euclidean distance between two points (x1, y1) and (x2, y2)."""
+    return math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+
+def main():
+    # 1. Random non-collinear points
+    eps = 1e-10
+    while True:
+        a1, b1 = random.uniform(-10, 10), random.uniform(-10, 10)
+        a2, b2 = random.uniform(-10, 10), random.uniform(-10, 10)
+        a3, b3 = random.uniform(-10, 10), random.uniform(-10, 10)
+        
+        # 2. Side lengths
+        l_ab = distance((a1, b1), (a2, b2))
+        l_bc = distance((a2, b2), (a3, b3))
+        l_ca = distance((a3, b3), (a1, b1))
+        
+        # Triangle validity check with tolerance
+        if (l_ab + l_bc > l_ca + eps) and (l_bc + l_ca > l_ab + eps) and (l_ca + l_ab > l_bc + eps):
+            # Check non-collinearity via area (shoelace formula)
+            area = abs(a1*(b2 - b3) + a2*(b3 - b1) + a3*(b1 - b2)) / 2
+            if area > eps:
+                break
+
+    print(f"Vertices:")
+    print(f"A({a1:.3f}, {b1:.3f})")
+    print(f"B({a2:.3f}, {b2:.3f})")
+    print(f"C({a3:.3f}, {b3:.3f})")
+    print(f"\nSide lengths: AB={l_ab:.3f}, BC={l_bc:.3f}, CA={l_ca:.3f}")
+
+    # 3. Midpoints of opposite sides
+    mid_BC = ((a2 + a3)/2, (b2 + b3)/2)  # opposite A
+    mid_CA = ((a3 + a1)/2, (b3 + b1)/2)  # opposite B
+    mid_AB = ((a1 + a2)/2, (b1 + b2)/2)  # opposite C
+
+    print(f"\nMidpoints:")
+    print(f"Mid_BC = ({mid_BC[0]:.3f}, {mid_BC[1]:.3f})")
+    print(f"Mid_CA = ({mid_CA[0]:.3f}, {mid_CA[1]:.3f})")
+    print(f"Mid_AB = ({mid_AB[0]:.3f}, {mid_AB[1]:.3f})")
+
+    # 4. Centroid (geometric mean of vertices)
+    centroid = ((a1 + a2 + a3)/3, (b1 + b2 + b3)/3)
+    print(f"\nCentroid = ({centroid[0]:.3f}, {centroid[1]:.3f})")
+
+    # 5. Median lengths (vertex → midpoint of opposite side)
+    M_A = distance((a1, b1), mid_BC)
+    M_B = distance((a2, b2), mid_CA)
+    M_C = distance((a3, b3), mid_AB)
+
+    # Distances from vertex → centroid
+    dA = distance((a1, b1), centroid)
+    dB = distance((a2, b2), centroid)
+    dC = distance((a3, b3), centroid)
+
+    print(f"\nMedian lengths: M_A={M_A:.3f}, M_B={M_B:.3f}, M_C={M_C:.3f}")
+    print(f"Distances vertex→centroid: dA={dA:.3f}, dB={dB:.3f}, dC={dC:.3f}")
+
+    # 6. Verify centroid divides medians in 2:1 ratio
+    rA, rB, rC = dA/M_A, dB/M_B, dC/M_C
+    print(f"\nRatio checks (should be ≈ 2/3):")
+    print(f"dA/M_A = {rA:.4f}, dB/M_B = {rB:.4f}, dC/M_C = {rC:.4f}")
+
+    tol = 1e-6
+    all_good = all(np.isclose([rA, rB, rC], 2/3, atol=tol))
+    if all_good:
+        print("\n✅ Centroid divides all medians in 2:1 ratio (as expected).")
+    else:
+        print("\n⚠️ Ratios deviate from 2:1 — numerical instability or degenerate geometry.")
+
+    # 7. Plot triangle, medians, midpoints, centroid
+    fig, ax = plt.subplots(figsize=(7, 7))
+    triangle_x = [a1, a2, a3, a1]
+    triangle_y = [b1, b2, b3, b1]
+    ax.plot(triangle_x, triangle_y, 'b-', linewidth=1.8, label='Triangle sides')
+
+    # Plot medians
+    ax.plot([a1, mid_BC[0]], [b1, mid_BC[1]], 'r--', label='Medians')
+    ax.plot([a2, mid_CA[0]], [b2, mid_CA[1]], 'r--')
+    ax.plot([a3, mid_AB[0]], [b3, mid_AB[1]], 'r--')
+
+    # Plot vertices
+    ax.scatter([a1, a2, a3], [b1, b2, b3], c='blue', s=60, label='Vertices')
+
+    # Plot midpoints
+    ax.scatter([mid_BC[0], mid_CA[0], mid_AB[0]],
+               [mid_BC[1], mid_CA[1], mid_AB[1]],
+               c='orange', s=60, label='Midpoints')
+
+    # Plot centroid
+    ax.scatter(centroid[0], centroid[1], c='green', s=120, marker='*', label='Centroid')
+
+    # Label points
+    ax.text(a1, b1, 'A', fontsize=12, ha='right')
+    ax.text(a2, b2, 'B', fontsize=12, ha='right')
+    ax.text(a3, b3, 'C', fontsize=12, ha='right')
+    ax.text(centroid[0], centroid[1], 'G', fontsize=12, ha='left', color='green')
+
+    ax.set_aspect('equal', 'box')
+    ax.grid(True, linestyle='--', linewidth=0.5)
+    ax.legend()
+    plt.title("Triangle, Midpoints, Medians, and Centroid")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
