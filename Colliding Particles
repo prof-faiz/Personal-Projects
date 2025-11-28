@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Aug 30 21:18:06 2025
+
+@author: khanf
+"""
+
+"""
+collide_ripples.py
+Colliding Particles -> local curvature ripples (Pygame)
+Author: ChatGPT for Faiz
+
+Features:
+- Two moving massive particles collide.
+- Collision spawns expanding curvature ripples that temporarily warp the grid.
+- Grid warp = sum of contributions from particles (inverse-power falloff) + ripple gaussians.
+Controls:
+- Drag a particle with left mouse (near its body).
+- Space: randomize & launch particles.
+- R: reset positions.
+- Esc/Q: quit.
+"""
+
+import pygame, sys, math, random, time
+
+# ---------------- PARAMETERS ----------------
+WIDTH, HEIGHT = 1200, 800
+BG_COLOR = (10, 12, 18)
+GRID_FADE = 110
+GRID_BASE_COLOR = (170, 190, 230)
+
+GRID_SPACING = 30
+SAMPLES_PER_LINE = 100   # higher -> smoother but slower
+FPS = 60
+
+# Static gravity-like parameters (for particle-induced warp)
+GLOBAL_WARP_STRENGTH = 1400.0
+FALLOFF = 2.0           # inverse-distance power
+MIN_DIST = 6.0
+
+# Particle visual/physics
+PARTICLE_RADIUS = 16
+PARTICLE_COLOR_A = (230, 120, 80)
+PARTICLE_COLOR_B = (120, 200, 250)
+PARTICLE_DEFAULT_MASS = 3.0   # controls warp strength
+PARTICLE_ELASTICITY = 0.9     # collision elasticity (0..1)
+
+# Ripple parameters
+# A ripple is an expanding ring described by radius(t) = speed * (t - t0)
+# ripple profile is a Gaussian around that ring; amplitude decays with time
+RIPPLE_SPEED = 260.0          # pixels / second (expansion speed)
+RIPPLE_INITIAL_WIDTH = 22.0   # width (sigma) of the Gaussian ring
+RIPPLE_DECAY = 0.8            # multiplicative decay per second (exponential)
+RIPPLE_ENERGY_SCALE = 0.0009  # scales kinetic energy -> initial amplitude
+
+# Particle motion (initial launch speed range)
+LAUNCH_SPEED_MIN = 40.0
+LAUNCH_SPEED_MAX = 220.0
+
+# Visual
+MASS_GLOW_RADIUS = PARTICLE_RADIUS * 4
+
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Colliding Particles → Curvature Ripples — Faiz")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("consolas", 14)
+
+# Precompute grid lines coordinates
+vertical_lines_x = list(range(0, WIDTH + GRID_SPACING, GRID_SPACING))
+horizontal_lines_y = list(range(0, HEIGHT + GRID_SPACING, GRID_SPACING))
+
+# ----------------- CLASSES -------------------
+class Particle:
+    def __init__(self, pos, vel, color, mass=PARTICLE_DEFAULT_MASS, radius=PARTICLE_RADIUS):
+        self.pos = pygame.Vector2(pos)
+        self.vel = pygame.Vector2(vel)
+        self.color = color
+        self.mass = mass
+        self.radius = radius
+        self.dragging = False
+
+    def kinetic_energy(self):
+        return 0.5 * self.mass * (self.vel.length_squared())
+
+    def update(self, dt):
+        # simple inertial motion (no global gravity)
+        self.pos += self.vel * dt
+
+        # wrap-around for cinematic effect (keeps them in view)
+        if self.pos.x < -self.radius: self.pos.x += WIDTH + 2*self.radius
+        if self.pos.x > WIDTH + self.radius: self.pos.x -= WIDTH + 2*self.radius
+        if self.pos.y < -self.radius: self.pos.y += HEIGHT + 2*self.radius
+        if self.pos.y > HEIGHT + self.radius: self.pos.y -= HEIGHT + 2*self.radius
+
+    def draw(self, surf):
+        # glow
+        glow = pygame.Surface((self.radius*6, self.radius*6), pygame.SRCALPHA)
+        cx = cy = self.radius*3
+        for r in range(int(self.radius*3), 0, -1):
+            a = max(0, min(160, int(40 * (r / (self.radius*3)))))
+            pygame.draw.circle(glow, (*self.color, a), (cx, cy), r)
+        surf.blit(glow, (self.pos.x - cx, self.pos.y - cy), special_flags=pygame.BLEND_RGBA_ADD)
+        # body
+        pygame.draw.circle(surf, self.color, (int(self.pos.x), int(self.pos.y)), self.radius)
+        # subtle outline
+        pygame.draw.circle(surf, (20,20,20), (int(self.pos.x), int(self.pos.y)), self.radius, 2)
+
+class Ripple:
+    def __init__(self, center, initial_amplitude, start_time):
+        self.center = pygame.Vector2(center)
+        self.amp0 = initial_amplitude  # initial amplitude (adds to warp)
+        self.t0 = start_time
+        self.width0 = RIPPLE_INITIAL_WIDTH
+
+    def amplitude_at(self, t):
+        # exponential decay with time
+        dt = max(0.0, t - self.t0)
+        return self.amp0 * math.exp(-RIPPLE_DECAY * dt)
+
+    def radius_at(self, t):
+        dt = max(0.0, t - self.t0)
+        return RIPPLE_SPEED * dt
+
+    def width_at(self, t):
+        # possibly widen slowly
+        return self.width0 * (1.0 + 0.15 * (t - self.t0))
+
+    def is_dead(self, t):
+        return self.amplitude_at(t) < 0.001
+
+# --------------- SCENE STATE -----------------
+# Two particles
+pA = Particle((WIDTH*0.30, HEIGHT*0.5), (160.0, -30.0), PARTICLE_COLOR_A, mass=3.8)
+pB = Particle((WIDTH*0.70, HEIGHT*0.5), (-140.0, 30.0), PARTICLE_COLOR_B, mass=3.0)
+particles = [pA, pB]
+
+ripples = []   # active Ripple objects
+
+# Helper: compute warp contribution at a point (x,y) from a particle mass
+def particle_warp_magnitude(px, py, particle):
+    dx = px - particle.pos.x
+    dy = py - particle.pos.y
+    dist = math.hypot(dx, dy)
+    if dist < MIN_DIST:
+        dist = MIN_DIST
+    # inverse power falloff, multiplied by particle mass
+    mag = -GLOBAL_WARP_STRENGTH * particle.mass / (dist ** FALLOFF)
+    return mag
+
+# Helper: compute ripple contribution at a point (x,y) for current time t
+def ripple_warp_magnitude(px, py, ripple, t):
+    # distance from ripple center to grid point
+    dx = px - ripple.center.x
+    dy = py - ripple.center.y
+    rad = math.hypot(dx, dy)
+    ring_r = ripple.radius_at(t)
+    width = ripple.width_at(t)
+    # Gaussian around ring: exp( - (rad - ring_r)^2 / (2 sigma^2) )
+    gauss = math.exp(- ((rad - ring_r) ** 2) / (2.0 * width * width))
+    return -GLOBAL_WARP_STRENGTH * ripple.amplitude_at(t) * gauss
+
+# Combined warp point: returns new warped coords for a grid point (x,y)
+def warp_point(x, y, t):
+    # Base displacement vector (we'll push points radially away/toward sources)
+    # We'll compute radial displacements by summing scalar warp magnitudes and moving along unit vector from source.
+    # For simplicity, treat total warp as radial from local dominant source (combined contributions considered as scalar)
+    # More physically: we add small radial displacements for each source and ripples.
+    total_dx = 0.0
+    total_dy = 0.0
+
+    # Particle contributions
+    for p in particles:
+        dx = x - p.pos.x
+        dy = y - p.pos.y
+        dist = math.hypot(dx, dy)
+        if dist < MIN_DIST: dist = MIN_DIST
+        ux, uy = dx/dist, dy/dist
+        mag = particle_warp_magnitude(x, y, p)
+        total_dx += ux * mag
+        total_dy += uy * mag
+
+    # Ripple contributions
+    for r in ripples:
+        dx = x - r.center.x
+        dy = y - r.center.y
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6: dist = 1e-6
+        ux, uy = dx/dist, dy/dist
+        mag = ripple_warp_magnitude(x, y, r, t)
+        total_dx += ux * mag
+        total_dy += uy * mag
+
+    # Apply displacement (clamp to avoid extreme jumps)
+    nx = x + total_dx
+    ny = y + total_dy
+    return pygame.Vector2(nx, ny)
+
+# Collision detection & response (elastic-ish)
+def handle_particle_collisions():
+    a, b = particles
+    offset = b.pos - a.pos
+    dist = offset.length()
+    min_dist = a.radius + b.radius
+    if dist <= 0:
+        return
+    if dist < min_dist:
+        # Move them apart proportionally to overlap
+        overlap = min_dist - dist
+        move_dir = offset.normalize()
+        # push each by half overlap (unless dragging)
+        if not a.dragging and not b.dragging:
+            a.pos += -move_dir * (overlap * 0.5)
+            b.pos += move_dir * (overlap * 0.5)
+        elif a.dragging and not b.dragging:
+            b.pos += move_dir * overlap
+        elif b.dragging and not a.dragging:
+            a.pos += -move_dir * overlap
+        # compute simple elastic collision in 2D using masses
+        # relative velocity
+        rel_v = b.vel - a.vel
+        # velocity along normal
+        vn = rel_v.dot(move_dir)
+        if vn < 0:
+            # impulse scalar
+            m1, m2 = a.mass, b.mass
+            e = PARTICLE_ELASTICITY
+            j = -(1 + e) * vn / (1/m1 + 1/m2)
+            impulse = move_dir * j
+            a.vel += -impulse / m1
+            b.vel += impulse / m2
+
+            # Spawn ripple according to energy released: proportional to combined KE before collision
+            ke = a.kinetic_energy() + b.kinetic_energy()
+            amplitude = ke * RIPPLE_ENERGY_SCALE
+            # limit amplitude
+            amplitude = max(0.08, min(6.0, amplitude))
+            # center ripple at collision point (midpoint)
+            collision_point = a.pos + move_dir * (a.radius - overlap*0.5)
+            ripples.append(Ripple(collision_point, amplitude, time.time()))
+
+# ------- Input / Controls -------
+def spawn_random():
+    # place two particles on opposite sides with random offsets and velocities toward each other
+    angle_spread = 0.25 * math.pi
+    mid = pygame.Vector2(WIDTH/2, HEIGHT/2)
+    r_sep = 220
+    theta = random.uniform(-0.5*angle_spread, 0.5*angle_spread)
+    a_pos = mid + pygame.Vector2(-r_sep*math.cos(theta), -r_sep*math.sin(theta))
+    b_pos = mid + pygame.Vector2(r_sep*math.cos(theta), r_sep*math.sin(theta))
+    speed1 = random.uniform(LAUNCH_SPEED_MIN, LAUNCH_SPEED_MAX)
+    speed2 = random.uniform(LAUNCH_SPEED_MIN, LAUNCH_SPEED_MAX)
+    dir1 = (mid - a_pos).normalize()
+    dir2 = (mid - b_pos).normalize()
+    pA.pos = a_pos; pA.vel = dir1 * speed1; pA.mass = random.uniform(2.0, 5.0)
+    pB.pos = b_pos; pB.vel = dir2 * speed2; pB.mass = random.uniform(2.0, 5.0)
+    ripples.clear()
+
+def reset_scene():
+    pA.pos = pygame.Vector2(WIDTH*0.30, HEIGHT*0.5); pA.vel = pygame.Vector2(160.0, -30.0); pA.mass = 3.8
+    pB.pos = pygame.Vector2(WIDTH*0.70, HEIGHT*0.5); pB.vel = pygame.Vector2(-140.0, 30.0); pB.mass = 3.0
+    ripples.clear()
+
+# ------- Drawing helpers -------
+def draw_grid(t):
+    # faint base grid
+    base = pygame.Surface((WIDTH, HEIGHT), flags=pygame.SRCALPHA)
+    base.set_alpha(GRID_FADE)
+    for x in vertical_lines_x:
+        pygame.draw.line(base, GRID_BASE_COLOR, (x, 0), (x, HEIGHT))
+    for y in horizontal_lines_y:
+        pygame.draw.line(base, GRID_BASE_COLOR, (0, y), (WIDTH, y))
+    screen.blit(base, (0,0))
+
+    # warped vertical lines
+    for x in vertical_lines_x:
+        samples = []
+        for i in range(SAMPLES_PER_LINE + 1):
+            t_ = i / SAMPLES_PER_LINE
+            by = t_ * HEIGHT
+            warped = warp_point(x, by, t)
+            samples.append((x, by, warped))
+        pts = [(p[2].x, p[2].y) for p in samples]
+        pygame.draw.aalines(screen, (140,170,210), False, pts, 1)
+
+    # warped horizontal lines
+    for y in horizontal_lines_y:
+        samples = []
+        for i in range(SAMPLES_PER_LINE + 1):
+            t_ = i / SAMPLES_PER_LINE
+            bx = t_ * WIDTH
+            warped = warp_point(bx, y, t)
+            samples.append((bx, y, warped))
+        pts = [(p[2].x, p[2].y) for p in samples]
+        pygame.draw.aalines(screen, (140,170,210), False, pts, 1)
+
+    # optionally draw ripple rings faintly for visualization
+    for r in ripples:
+        rad = r.radius_at(t)
+        amp = r.amplitude_at(t)
+        if amp > 0.01:
+            alpha = int(max(10, min(110, 80 * amp)))
+            col = (200, 220, 255, alpha)
+            s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            pygame.draw.circle(s, col, (int(r.center.x), int(r.center.y)), int(rad), width=2)
+            screen.blit(s, (0,0), special_flags=pygame.BLEND_RGBA_ADD)
+
+def draw_ui():
+    lines = [
+        "Colliding particles → generate local curvature ripples",
+        "Controls: Drag particle | Space: random launch | R: reset | Q/Esc: quit",
+        f"Particles: masses = [{pA.mass:.2f}, {pB.mass:.2f}]  Ripples active = {len(ripples)}",
+    ]
+    y = 8
+    for line in lines:
+        txt = font.render(line, True, (220,220,220))
+        screen.blit(txt, (8,y)); y += 18
+
+# -------------- Main Loop -------------------
+def main_loop():
+    dragging_particle = None
+    last_time = time.time()
+    reset_scene()
+
+    while True:
+        dt = clock.tick(FPS) / 1000.0
+        tnow = time.time()
+
+        # ---- events ----
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit(0)
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
+                    pygame.quit(); sys.exit(0)
+                elif ev.key == pygame.K_SPACE:
+                    spawn_random()
+                elif ev.key == pygame.K_r:
+                    reset_scene()
+            elif ev.type == pygame.MOUSEBUTTONDOWN:
+                if ev.button == 1:
+                    mpos = pygame.Vector2(ev.pos)
+                    # pick nearest particle within radius
+                    for p in particles:
+                        if mpos.distance_to(p.pos) <= p.radius * 1.4:
+                            p.dragging = True
+                            dragging_particle = p
+                            p.vel = pygame.Vector2(0,0)
+                            break
+            elif ev.type == pygame.MOUSEBUTTONUP:
+                if ev.button == 1:
+                    if dragging_particle:
+                        dragging_particle.dragging = False
+                        dragging_particle = None
+            elif ev.type == pygame.MOUSEMOTION:
+                if dragging_particle:
+                    dragging_particle.pos = pygame.Vector2(ev.pos)
+
+        # ---- physics updates ----
+        for p in particles:
+            if not p.dragging:
+                p.update(dt)
+
+        handle_particle_collisions()
+
+        # Update ripples: remove dead ones
+        ripples[:] = [r for r in ripples if not r.is_dead(tnow)]
+
+        # ---- drawing ----
+        screen.fill(BG_COLOR)
+        draw_grid(tnow)
+
+        # draw particles on top
+        for p in particles:
+            p.draw(screen)
+
+        draw_ui()
+        pygame.display.flip()
+
+if __name__ == "__main__":
+    main_loop()
