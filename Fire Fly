@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+"""
+Bioluminescent agents simulation (fireflies / dinoflagellates)
+Python Pygame version – converted from React/JS
+"""
+
+import pygame
+import random
+import math
+import numpy as np
+
+# ----------------- Helpers -----------------
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def randn():
+    # Box-Muller
+    u = random.random()
+    v = random.random()
+    return math.sqrt(-2.0 * math.log(u)) * math.cos(2.0 * math.pi * v)
+
+class RNG:
+    def __init__(self, seed=None):
+        if seed is None:
+            seed = random.randint(0, 1e7)
+        self.s = int(seed) & 0xFFFFFFFF
+
+    def next(self):
+        # xorshift32
+        x = self.s
+        x ^= (x << 13) & 0xFFFFFFF1
+        x ^= (x >> 17) & 0xFEFFFFF2
+        x ^= (x << 5) & 0xFFFFFFF3
+        self.s = x & 0xFFFFFFF4
+        return (self.s & 0xFFFFFFFF) / 0x100000000
+
+    def normal(self):
+        return sum(self.next() for _ in range(6)) - 3
+
+
+# ----------------- Agent -----------------
+class Agent:
+    def __init__(self, rng, W, H, params):
+        self.rng = rng
+        self.W, self.H = W, H
+        self.x = rng.next() * W
+        self.y = rng.next() * H
+        ang = rng.next() * math.tau
+        v0 = params["speedMean"] + params["speedStd"] * rng.normal()
+        self.vx = math.cos(ang) * v0
+        self.vy = math.sin(ang) * v0
+
+        # Chemistry
+
+        self.L = params["L0"] * (0.8 + 0.4 * rng.next())
+        self.ATP = params["ATP0"] * (0.8 + 0.4 * rng.next())
+        self.gate = params["Ca0"] if params["mode"] == "firefly" else params["pH0"]
+        self.afterglow = 0
+        self.lastFlashT = -1e7
+
+    def resourceAt(self, x, y, params):
+        nx, ny = x / self.W, y / self.H
+        v = 0.5 + 0.5 * math.sin(2 * math.pi * (nx * params["resourceFreq"] + 0.123)) \
+            * math.cos(2 * math.pi * (ny * params["resourceFreq"] + 0.271))
+        return 1 + params["resourceContrast"] * (v - 0.5) * 2
+
+    def step(self, dt, t, neighbors, params):
+        # --- Motion ---
+        speed = math.hypot(self.vx, self.vy)
+        ang = math.atan2(self.vy, self.vx)
+        dang = params["turnStd"] * math.sqrt(dt) * self.rng.normal()
+        newAng = ang + dang
+        newSpeed = clamp(speed + params["speedStd"] * math.sqrt(dt) * self.rng.normal(),
+                         0, params["speedMean"] * 3)
+        newSpeed = newSpeed * (1 - params["velDamp"] * dt) + params["speedMean"] * params["velDamp"] * dt
+        self.vx, self.vy = math.cos(newAng) * newSpeed, math.sin(newAng) * newSpeed
+        self.x = (self.x + self.vx * dt + self.W) % self.W
+        self.y = (self.y + self.vy * dt + self.H) % self.H
+
+        # --- Chemistry ---
+        vL = self.L / (params["KmL"] + self.L)
+        vA = self.ATP / (params["KmATP"] + self.ATP)
+        vO = params["O2"] / (params["KmO2"] + params["O2"])
+
+        if params["mode"] == "firefly":
+            Ca = self.gate
+            dCa = -(Ca - params["Ca0"]) / params["tauGate"]
+            drive = 0
+            if self.rng.next() < 1 - math.exp(-params["pulseRate"] * dt):
+                drive += params["pulseAmp"]
+            for nb in neighbors:
+                if nb is self:
+                    continue
+                dx, dy = abs(nb.x - self.x), abs(nb.y - self.y)
+                ddx = min(dx, self.W - dx)
+                ddy = min(dy, self.H - dy)
+                d2 = ddx*ddx + ddy*ddy
+                if d2 < params["couplingRadius"]**2 and (t - nb.lastFlashT) < params["couplingWindow"]:
+                    w = math.exp(-d2 / (params["couplingRadius"]**2))
+                    drive += params["couplingStrength"] * w * params["pulseAmp"] * 0.3
+            self.gate = max(0, Ca + (dCa + drive) * dt)
+        else:
+            pH = self.gate
+            dpH = -(pH - params["pH0"]) / params["tauGate"]
+            disturb = params.get("disturbanceSensitivity", 0.8) * (
+                math.hypot(self.vx, self.vy) / (params["speedMean"] + 1e-6)) * 0.1
+            if self.rng.next() < 1 - math.exp(-params["pulseRate"] * dt):
+                disturb += params["pulseAmp"]
+            self.gate = max(0, pH + (dpH + disturb) * dt)
+
+        f = (self.gate**params["nHill"]) / (params["Kgate"]**params["nHill"] + self.gate**params["nHill"] + 1e-9)
+        Vmax = params["Vbase"] + (params["Vpeak"] - params["Vbase"]) * f
+        v = Vmax * vL * vA * vO
+        dL, dATP = -v * dt, -v * dt
+
+        res = self.resourceAt(self.x, self.y, params)
+        rL, rATP = params["refuelL"] * res * dt, params["refuelATP"] * res * dt
+        self.L = clamp(self.L + dL + rL, 0, params["L0"] * 2)
+        self.ATP = clamp(self.ATP + dATP + rATP, 0, params["ATP0"] * 2)
+
+        brightness = math.tanh(params["brightnessScale"] * v)
+        self.afterglow = max(brightness, self.afterglow * math.exp(-dt / params["afterglowTau"]))
+
+        if v > params["flashThreshold"]:
+            self.lastFlashT = t
+
+        return self.afterglow
+
+
+# ----------------- Simulation -----------------
+def main():
+    pygame.init()
+    W, H = 900, 600
+    screen = pygame.display.set_mode((W, H))
+    clock = pygame.time.Clock()
+
+    params = dict(
+        mode="firefly",  # "firefly" | "dinoflagellate"
+        N=50,
+        brightnessScale=5.0,
+        afterglowTau=0.1,
+        pointRadius=2.0,
+        speedMean=20, speedStd=6, velDamp=0.5, turnStd=1.5,
+        L0=50, ATP0=100, KmL=5, KmATP=20, KmO2=10, O2=50,
+        Vbase=0.02, Vpeak=2.5, nHill=3,
+        Ca0=0.1, Kgate=0.5, tauGate=0.8,
+        pulseRate=1.0, pulseAmp=2.8,
+        pH0=0.1,
+        couplingStrength=0.6, couplingRadius=90, couplingWindow=0.35,
+        refuelL=0.05, refuelATP=0.1,
+        resourceContrast=0.35, resourceFreq=1.2,
+        flashThreshold=0.25,
+    )
+
+    rng = RNG()
+    agents = [Agent(RNG(rng.next() * 1e9), W, H, params) for _ in range(params["N"])]
+
+    running, t = True, 0
+    while running:
+        dt = clock.tick(60) / 1000.0
+        t += dt
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+
+        screen.fill((0, 0, 0))
+        color = (120, 255, 120) if params["mode"] == "firefly" else (120, 220, 255)
+
+        for a in agents:
+            neighbors = agents  # naive all-to-all (optimize if needed)
+            afterglow = a.step(dt, t, neighbors, params)
+            radius = int(params["pointRadius"] * 6)
+            alpha = int(clamp(afterglow, 0, 1) * 255)
+            s = pygame.Surface((radius*2, radius*2), pygame.SRCALPHA)
+            pygame.draw.circle(s, (*color, alpha), (radius, radius), radius)
+            screen.blit(s, (a.x - radius, a.y - radius))
+            pygame.draw.circle(screen, color, (int(a.x), int(a.y)), int(params["pointRadius"]))
+
+        pygame.display.flip()
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
